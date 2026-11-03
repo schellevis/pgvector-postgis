@@ -41,19 +41,19 @@ jobs:
 
       - name: Test extensions
         run: |
-          docker run -d --name t -e POSTGRES_PASSWORD=test test-image
+          docker run -d --name pgtest -e POSTGRES_PASSWORD=test test-image
           # init runs a temporary server first; wait for the real one
           for i in $(seq 60); do
-            [ "$(docker logs t 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break
+            [ "$(docker logs pgtest 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break
             sleep 2
           done
-          docker exec t psql -U postgres -v ON_ERROR_STOP=1 \
+          docker exec pgtest psql -U postgres -v ON_ERROR_STOP=1 \
             -c "CREATE EXTENSION postgis;" \
             -c "CREATE EXTENSION vector;" \
             -c "SELECT postgis_full_version();" \
             -c "SELECT extname, extversion FROM pg_extension ORDER BY 1;" \
             -c "SELECT ST_Distance('SRID=28992;POINT(0 0)'::geometry, 'SRID=28992;POINT(3 4)'::geometry) AS d, '[1,2,3]'::vector <-> '[1,2,4]'::vector AS v;"
-          docker rm -f t
+          docker rm -f pgtest
 
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
