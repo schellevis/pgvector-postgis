@@ -16,48 +16,92 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
   PG_MAJOR: "18"
   DEBIAN_RELEASE: bookworm
+  # expectations for the test step; must match the Dockerfile / base image
+  EXPECT_DEBIAN_MAJOR: "12"
+  EXPECT_GLIBC: "2.36"
+  EXPECT_POSTGIS: "3.7"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Scheduled runs use a fresh cache scope, so apt layers are rebuilt and
+      # PostGIS / Debian updates are actually picked up. Within a run the
+      # tested amd64 layers are reused by the push step.
+      - name: Choose cache scope
+        id: cache
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            echo "scope=run-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "scope=main" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build amd64 for testing
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64
           build-args: |
             PG_MAJOR=${{ env.PG_MAJOR }}
             DEBIAN_RELEASE=${{ env.DEBIAN_RELEASE }}
+            POSTGIS_VERSION=${{ env.EXPECT_POSTGIS }}
           pull: true
           load: true
           tags: test-image
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ steps.cache.outputs.scope }}
+          cache-to: type=gha,mode=max,scope=${{ steps.cache.outputs.scope }}
 
-      - name: Test extensions
+      - name: Test image
+        id: test
         run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          # base OS / glibc must not drift (collation compatibility of existing data)
+          deb=$(docker run --rm --entrypoint cat test-image /etc/debian_version)
+          glibc=$(docker run --rm --entrypoint sh test-image -c 'ldd --version | head -1 | awk "{print \$NF}"')
+          echo "debian=$deb glibc=$glibc"
+          [[ "$deb" == "$EXPECT_DEBIAN_MAJOR".* ]] || fail "Debian $deb, expected $EXPECT_DEBIAN_MAJOR.x"
+          [[ "$glibc" == "$EXPECT_GLIBC" ]] || fail "glibc $glibc, expected $EXPECT_GLIBC"
+          docker run --rm --entrypoint dpkg test-image -l "postgresql-$PG_MAJOR" "postgresql-$PG_MAJOR-postgis-3" | grep '^[hi]i'
+
           docker run -d --name pgtest -e POSTGRES_PASSWORD=test test-image
+          trap 'docker logs pgtest 2>&1 | tail -20; docker rm -f pgtest >/dev/null' EXIT
           # init runs a temporary server first; wait for the real one
           for i in $(seq 60); do
             [ "$(docker logs pgtest 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break
             sleep 2
           done
-          docker exec pgtest psql -U postgres -v ON_ERROR_STOP=1 \
-            -c "CREATE EXTENSION postgis;" \
-            -c "CREATE EXTENSION vector;" \
-            -c "SELECT postgis_full_version();" \
-            -c "SELECT extname, extversion FROM pg_extension ORDER BY 1;" \
-            -c "SELECT ST_Distance('SRID=28992;POINT(0 0)'::geometry, 'SRID=28992;POINT(3 4)'::geometry) AS d, '[1,2,3]'::vector <-> '[1,2,4]'::vector AS v;"
-          docker rm -f pgtest
+          q() { docker exec pgtest psql -U postgres -v ON_ERROR_STOP=1 -Atc "$1"; }
+
+          q "CREATE EXTENSION postgis"
+          q "CREATE EXTENSION vector"
+          pgver=$(q "SHOW server_version")
+          postgis=$(q "SELECT extversion FROM pg_extension WHERE extname = 'postgis'")
+          vector=$(q "SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+          echo "postgres=$pgver postgis=$postgis pgvector=$vector"
+          [[ "$pgver" == "$PG_MAJOR".* ]] || fail "PostgreSQL $pgver, expected $PG_MAJOR.x"
+          [[ "$postgis" == "$EXPECT_POSTGIS".* ]] || fail "PostGIS $postgis, expected $EXPECT_POSTGIS.x"
+
+          [ "$(q "SELECT ST_Distance('SRID=28992;POINT(0 0)'::geometry, 'SRID=28992;POINT(3 4)'::geometry)")" = 5 ] \
+            || fail "PostGIS distance check failed"
+          [ "$(q "SELECT ST_AsText(ST_Transform('SRID=28992;POINT(155000 463000)'::geometry, 4326)) LIKE 'POINT(5.38%'")" = t ] \
+            || fail "PROJ transform check failed"
+          [ "$(q "SELECT '[1,2,3]'::vector <-> '[1,2,4]'::vector")" = 1 ] \
+            || fail "pgvector distance check failed"
+
+          echo "postgis=$postgis" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -65,20 +109,36 @@ jobs:
 
       - name: Build and push multi-arch
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           build-args: |
             PG_MAJOR=${{ env.PG_MAJOR }}
             DEBIAN_RELEASE=${{ env.DEBIAN_RELEASE }}
+            POSTGIS_VERSION=${{ env.EXPECT_POSTGIS }}
           pull: true
           push: true
           tags: |
             ${{ env.IMAGE }}:pg${{ env.PG_MAJOR }}
             ${{ env.IMAGE }}:pg${{ env.PG_MAJOR }}-${{ env.DEBIAN_RELEASE }}
+            ${{ env.IMAGE }}:pg${{ env.PG_MAJOR }}-${{ env.DEBIAN_RELEASE }}-postgis${{ steps.test.outputs.postgis }}
+            ${{ env.IMAGE }}:pg${{ env.PG_MAJOR }}-${{ env.DEBIAN_RELEASE }}-${{ steps.test.outputs.date }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=PostgreSQL ${{ env.PG_MAJOR }} with pgvector and PostGIS
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=${{ steps.cache.outputs.scope }}
+          cache-to: type=gha,mode=max,scope=${{ steps.cache.outputs.scope }}
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Pushed"
+            echo
+            echo '```'
+            echo "${IMAGE}:pg${PG_MAJOR}-${DEBIAN_RELEASE}-${{ steps.test.outputs.date }}@${{ steps.push.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
