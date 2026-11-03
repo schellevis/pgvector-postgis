@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  PG_MAJOR: "18"
+  DEBIAN_RELEASE: bookworm
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build amd64 for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            PG_MAJOR=${{ env.PG_MAJOR }}
+            DEBIAN_RELEASE=${{ env.DEBIAN_RELEASE }}
+          pull: true
+          load: true
+          tags: test-image
+          cache-to: type=gha,mode=max
+
+      - name: Test extensions
+        run: |
+          docker run -d --name t -e POSTGRES_PASSWORD=test test-image
+          # init runs a temporary server first; wait for the real one
+          for i in $(seq 60); do
+            [ "$(docker logs t 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break
+            sleep 2
+          done
+          docker exec t psql -U postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION postgis;" \
+            -c "CREATE EXTENSION vector;" \
+            -c "SELECT postgis_full_version();" \
+            -c "SELECT extname, extversion FROM pg_extension ORDER BY 1;" \
+            -c "SELECT ST_Distance('SRID=28992;POINT(0 0)'::geometry, 'SRID=28992;POINT(3 4)'::geometry) AS d, '[1,2,3]'::vector <-> '[1,2,4]'::vector AS v;"
+          docker rm -f t
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            PG_MAJOR=${{ env.PG_MAJOR }}
+            DEBIAN_RELEASE=${{ env.DEBIAN_RELEASE }}
+          pull: true
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:pg${{ env.PG_MAJOR }}
+            ${{ env.IMAGE }}:pg${{ env.PG_MAJOR }}-${{ env.DEBIAN_RELEASE }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=PostgreSQL ${{ env.PG_MAJOR }} with pgvector and PostGIS
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
