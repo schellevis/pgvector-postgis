@@ -12,7 +12,7 @@ replace `pgvector/pgvector:pg18-bookworm` on an existing data directory.
 |---|---|---|
 | `pg18`, `pg18-bookworm` | yes, every build | PostgreSQL 18 + pgvector + PostGIS 3.7.x, Debian 12 |
 | `pg18-bookworm-postgis3.7.0` | yes, until the next PostGIS patch | same, specific PostGIS release |
-| `pg18-bookworm-YYYYMMDD` | no | snapshot of one build, use this (or a digest) to pin / roll back |
+| `pg18-bookworm-YYYYMMDD.N` | no | snapshot of one build (date + CI run number), use this (or a digest) to pin / roll back |
 
 Image: `ghcr.io/schellevis/pgvector-postgis`. Platforms: `linux/amd64`, `linux/arm64`
 (only amd64 is tested in CI).
@@ -43,7 +43,7 @@ SELECT postgis_extensions_upgrade();
 ```yaml
 services:
   postgres:
-    image: ghcr.io/schellevis/pgvector-postgis:pg18-bookworm-YYYYMMDD
+    image: ghcr.io/schellevis/pgvector-postgis:pg18-bookworm-YYYYMMDD.N
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
